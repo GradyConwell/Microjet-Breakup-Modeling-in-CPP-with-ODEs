@@ -75,9 +75,10 @@ int main() {
     }
     // boundaries are "closed" to not influence the interior flow (ie, not changing at edges)
     // first node is equal to the second node
-    C[0] = C[1];
+    //C[0] = C[1];
+
     // last node is equal to the second to last node
-    C[SimulationParameters.Nodes - 1] = C[SimulationParameters.Nodes - 2];
+    //C[SimulationParameters.Nodes - 1] = C[SimulationParameters.Nodes - 2];
 
     // Create ODEs for Heyoka
     vector<pair<expression,expression>> odes;
@@ -96,11 +97,29 @@ int main() {
         auto Cp = dC(h, i); // C prime
 
         auto dvdt = -v[i] * vp - (gamma / rho) * Cp + 3 * mu / rho * (vpp + 2 * hp / h[i] * vp);
-        auto dhdt =
+        auto dhdt = -v[i] * hp - 0.500 * h[i] * vp;
 
-        
-        
+        // store node in vectors
+        ode.pushback({h[i], dhdt});
+        ode.pushback({v[i], dvdt});
     }
+
+    // Create integrator object
+    // taylor_adaptive<type>{expressions, initial values}
+    vector<double> initValues(2 * SimulationParameters.Nodes);
+    for (int i = 0; i < SimulationParameters.Nodes; i++) {
+        double z = i * SimulationParameters.dz;
+        // modulation of "nozzle radius" to perturb the jet
+        double h = 
+        
+        
+    
+
+    ta = taylor_adaptive<double>{odes, initValues};
+
+    }
+
+
 
     
 return 0;
