@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <numeric>
 #include <algorithm>
+#include <fstream>
 #include <heyoka/heyoka.hpp>
 
 using namespace std;
@@ -17,13 +18,23 @@ struct PhysicalParameters {
     const double mu = 0.00365; // dynamic viscosity of water in Pa * s
     const double h0 = 18.5e-6; // initial jet radius in m
     const double v0 = 5.4; // initial jet velocity in m / s
-    
+    const double amp = 0.005; // amplitude of initial perturbation (very small)
+    const double f = 20e3; // perturbation frequency Hz
 };
 struct SimulationParameters {
     const int Nodes = 120; // number of grid nodes
     const double Length = 500e-6; // domain length, default of 500µm
     const double dz = Length / (Nodes - 1); // grid spacing
 };
+
+void initCSV(const char* filename) {
+    // open file
+    ofstream file(filename);
+    // write header
+    file << "t,h_0,v_0,h_1,v_1,...,h_{N-1},v_{N-1}" << endl;
+    // close file
+    file.close();
+}
 
 int main() {
     // Create state variables for each nodes in the domain
@@ -110,17 +121,46 @@ int main() {
     for (int i = 0; i < SimulationParameters.Nodes; i++) {
         double z = i * SimulationParameters.dz;
         // modulation of "nozzle radius" to perturb the jet
-        double h = 
-        
-        
-    
-
+        double hInit = h0 + amp / h0 * sin(2 * PI * f);
+        // maintain constant flowrate thru nozzle 
+        double vInit = v0*h0**2 / hInit**2;
+        // Store in array
+        initValues[2*i] = hInit;
+        initValues[2*i + 1] = vInit;
+    }
+   
     ta = taylor_adaptive<double>{odes, initValues};
 
+    // Integrate
+    double initialTime = 0; // initial time
+    double finalTime = 50 * 1e-6; // 100 microseconds, final time
+    double sampleTime = 1 * 1e-6; // sample every microsecond
+
+    // set initial time
+    ta.set_time(initialTime);
+    double t = ta.get_time();
+    
+    // create storage vector
+    vector<double> state = ta.get_state();
+    
+    // get date
+    time_t now = time(0);
+    tm* ltm = localtime(&now);
+    string date = to_string(ltm->tm_mon + 1) + "-" + to_string(ltm->tm_mday) + "-" + to_string(ltm->tm_year + 1900);
+    // Integrate until final time
+    initCSV("microjet" + date + ".csv");
+
+    while (t < finalTime) {
+        ta.step();
+        t = ta.get_time();
+        state = ta.get_state();
+        // Save state
+        // Maybe worth changing later, but storing right in memory should be fastest.
+        while (t < finalTime) {
+            ta.step();
+            history.push_back({ta.get_time(), ta.get_state()});
+        }
     }
 
-
-
-    
-return 0;
+    return 0;
 }
