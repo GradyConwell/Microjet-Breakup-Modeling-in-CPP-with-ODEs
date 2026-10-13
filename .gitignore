@@ -1,0 +1,8 @@
+# Binaries and object files
+*.o
+*.dSYM/
+microjet
+main
+
+# IDE / OS files
+.DS_Store
