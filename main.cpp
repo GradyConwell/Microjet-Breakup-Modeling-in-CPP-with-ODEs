@@ -42,5 +42,66 @@ int main() {
     // https://en.wikipedia.org/wiki/Stencil_(numerical_analysis)
     // Next step: create expressions for stencils IOT create set of solvable ODEs for heyoka
 
-    return 0;
+    // stencils
+    auto d1 = [&](vector<expression>& u, int i) {
+        return (u[i + 1] - u[i - 1]) / (2.0 * SimulationParameters.dz);
+    };
+    // create second derivative stencil
+    auto d2 = [&](vector<expression>& u, int i) {
+        return (u[i + 1] - 2.0 * u[i] + u[i - 1]) / (SimulationParameters.dz * SimulationParameters.dz);
+    };
+
+    // calculate curvature at a node (C)
+    // pass in curvature(expression, index)
+    auto curvature = [&](vector<expression>& u, int i) {
+        auto hp = d1(u, i); // h prime at i
+        auto hpp = d2(u, i); // h double prime at i
+        auto term1 = 1.0 + hp * hp; // (1 + (h')^2) term    
+        return 1.0 / (u[i] * sqrt(term1)) - hpp / pow(term1, 1.5);
+    };
+
+    // calculate spatial derivative of curvature (C')
+    auto dC = [&](vector<expression>& u, int i) {
+        auto Cp = (curvature(u, i + 1) - curvature(u, i - 1)) / (2.0 * SimulationParameters.dz);
+        return Cp;
+    };
+    
+    // create curvature vector for all points i (excluding boundaries)
+    vector<expression> C(SimulationParameters.Nodes);   
+    C.reserve(SimulationParameters.Nodes);
+
+    for (int i = 1; i < SimulationParameters.Nodes - 1; i++) {
+        C[i] = curvature(h, i);
+    }
+    // boundaries are "closed" to not influence the interior flow (ie, not changing at edges)
+    // first node is equal to the second node
+    C[0] = C[1];
+    // last node is equal to the second to last node
+    C[SimulationParameters.Nodes - 1] = C[SimulationParameters.Nodes - 2];
+
+    // Create ODEs for Heyoka
+    vector<pair<expression,expression>> odes;
+
+    // Boundary Node 0 (only boundary that I control)
+    odes.push_back({h[0], 0.0}); // h' = 0 (radius not changing, equal to initial radius)
+    odes.push_back({v[0], 0.0}); // v' = 0 (velocity not changing, equal to initial velocity)
+
+    // Nodes
+    for (int i = 0, i < N-1, i++){
+        // set up terms of equations.
+        // patterned in stencils above.
+        auto hp = d1(h, i); // h prime
+        auto vp = d1(v, i); // v prime
+        auto vpp = d2(v, i);// v double prime
+        auto Cp = dC(h, i); // C prime
+
+        auto dvdt = -v[i] * vp - (gamma / rho) * Cp + 3 * mu / rho * (vpp + 2 * hp / h[i] * vp);
+        auto dhdt =
+
+        
+        
+    }
+
+    
+return 0;
 }
