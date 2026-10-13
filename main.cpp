@@ -27,6 +27,7 @@ struct SimulationParameters {
 
 int main() {
     // Create state variables for each nodes in the domain
+    // let h be the jet radius at each node, and v be the axial velocity at each node
     vector<expression> h(SimulationParameters.Nodes), v(SimulationParameters.Nodes);
     // explicitly allocate space for each node
     h.reserve(SimulationParameters.Nodes);
