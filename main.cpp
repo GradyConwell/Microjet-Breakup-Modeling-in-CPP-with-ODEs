@@ -13,28 +13,22 @@
 using namespace std;
 using namespace heyoka;
 
-// Simulation parameters, mostly pulled from Van houve et al. III.a
-// "A 40% w/w glycerol-saline solution"
+// Simulation parameters from Van Hoeve et al. (2010), Section III.A
+// 40% w/w glycerol-saline solution (18.5 µm microjet)
 struct PhysicalParameters {
-    // const double rho = 1098; // density of water in kg / m^3
-    // const double gamma = 0.0679; // surface tension of water in N / m
-    // const double mu = 0.00365; // dynamic viscosity of water in Pa * s
-
-    // 40% glycerol saline solution parameters
-    const double rho = 1003; // density of saline solution in kg / m^3
-    const double gamma = 0.072; // surface tension of saline solution in N / m
-    const double mu = 0.001; // dynamic viscosity of saline solution in Pa * s
-
-    const double h0 = 1.25e-6; // initial jet radius in m
-    const double v0 = 35; // initial jet velocity in m / s
-    const double amp = 0.1; // amplitude of initial perturbation (very small)
-    const double f = 33e3; // perturbation frequency Hz
+    const double rho = 1098.0;   // density of 40% glycerol-saline in kg / m^3
+    const double gamma = 0.0679; // surface tension in N / m
+    const double mu = 0.00365;   // dynamic viscosity in Pa * s
+    const double h0 = 18.5e-6;   // initial jet radius in m
+    const double v0 = 5.4;       // initial jet velocity in m / s
+    const double amp = 0.05;     // amplitude of initial perturbation
+    const double f = 32849.33;   // optimum Rayleigh frequency (v0 / lambda_opt) in Hz
 } PhysicalParameters;
 const auto [rho, gamma, mu, h0, v0, amp, f] = PhysicalParameters;
 
 struct SimulationParameters {
-    const int Nodes = 120; // number of grid nodes
-    const double Length = 500e-6; // domain length, default of 500µm
+    const int Nodes = 175; // number of grid nodes
+    const double Length = 700e-6; // domain length: 700 µm
     const double dz = Length / (Nodes - 1); // grid spacing
 } SimulationParameters;
 const int N = SimulationParameters.Nodes;
@@ -185,7 +179,7 @@ int main() {
 
     // Integrate
     double initialTime = 0; // initial time
-    double finalTime = 50 * 1e-6; // 50 microseconds, final time
+    double finalTime = 70 * 1e-6; // 70 microseconds, final time
     double sampleTime = 1 * 1e-6; // sample every microsecond
 
     // set initial time
@@ -217,12 +211,34 @@ int main() {
     while (t < finalTime) {
         ta.propagate_until(nextSample); // work until next checkpoint
         t = ta.get_time();
+        vector<double> currentState = ta.get_state();
+
+        // Check minimum radius to detect state prior to breakup
+        double min_h = currentState[0];
+        bool has_nan = false;
+        for (int i = 0; i < N; i++) {
+            double hi = currentState[2 * i];
+            if (std::isnan(hi)) { has_nan = true; break; }
+            if (hi < min_h) min_h = hi;
+        }
+
+        if (has_nan) {
+            cout << "Encountered non-finite values at t = " << t * 1e6 << " µs, halting." << endl;
+            break;
+        }
 
         // write row and flush
         file << t;
-        for (double x : ta.get_state()) file << "," << x;
+        for (double x : currentState) file << "," << x;
         file << "\n";
         file.flush();
+
+        // Break if jet has developed deep neck right prior to breakup (pinch-off)
+        if (min_h <= 2.0e-6) {
+            cout << "Jet profile prior to breakup captured: h_min = " << min_h * 1e6
+                 << " µm at t = " << t * 1e6 << " µs." << endl;
+            break;
+        }
 
         nextSample += sampleTime;
     }

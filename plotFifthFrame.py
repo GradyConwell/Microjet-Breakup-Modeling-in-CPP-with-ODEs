@@ -14,7 +14,7 @@ ro.r('fifthFrame$h_um <- fifthFrame$h * 1e6')
 
 ro.r('''
 p <- create_line_plot(fifthFrame, "z_um", "h_um",
-    title = "Jet Radius at Final Time",
+    title = "Jet Radius at t = 5 µs",
     x_label = "z (µm)",
     y_label = "Radius h (µm)") +
     expand_limits(y = 0)
