@@ -16,13 +16,19 @@ using namespace heyoka;
 // Simulation parameters, mostly pulled from Van houve et al. III.a
 // "A 40% w/w glycerol-saline solution"
 struct PhysicalParameters {
-    const double rho = 1098; // density of water in kg / m^3
-    const double gamma = 0.0679; // surface tension of water in N / m
-    const double mu = 0.00365; // dynamic viscosity of water in Pa * s
-    const double h0 = 18.5e-6; // initial jet radius in m
-    const double v0 = 5.4; // initial jet velocity in m / s
-    const double amp = 0.005; // amplitude of initial perturbation (very small)
-    const double f = 20e3; // perturbation frequency Hz
+    // const double rho = 1098; // density of water in kg / m^3
+    // const double gamma = 0.0679; // surface tension of water in N / m
+    // const double mu = 0.00365; // dynamic viscosity of water in Pa * s
+
+    // 40% glycerol saline solution parameters
+    const double rho = 1003; // density of saline solution in kg / m^3
+    const double gamma = 0.072; // surface tension of saline solution in N / m
+    const double mu = 0.001; // dynamic viscosity of saline solution in Pa * s
+
+    const double h0 = 1.25e-6; // initial jet radius in m
+    const double v0 = 35; // initial jet velocity in m / s
+    const double amp = 0.1; // amplitude of initial perturbation (very small)
+    const double f = 33e3; // perturbation frequency Hz
 } PhysicalParameters;
 const auto [rho, gamma, mu, h0, v0, amp, f] = PhysicalParameters;
 
@@ -233,6 +239,42 @@ int main() {
     for (int i = 0; i < N; i++) {
         lastFile << i << "," << i * SimulationParameters.dz << "," << lastState[2*i] << "," << lastState[2*i + 1] << "\n";
     }
+
+    file.close();
+
+    // write the fifth frame in long format from the microjetDATE.csv file
+    // read microjetDATE.csv, find the row at t = 5 * sampleTime (5.0e-6 s), and write it to a new CSV
+    ifstream inFile(filename);
+    ofstream fifthFile("microjet_5th_frame.csv");
+    fifthFile << setprecision(17);
+    fifthFile << "node,z,h,v\n";
+
+    double targetTime = 5 * sampleTime; // 5 µs
+    string line;
+    // Skip header line
+    if (getline(inFile, line)) {
+        while (getline(inFile, line)) {
+            stringstream ss(line);
+            string cell;
+            if (!getline(ss, cell, ',')) continue;
+            
+            double rowTime = stod(cell);
+            if (abs(rowTime - targetTime) < 0.5 * sampleTime) {
+                // Parse the state values: h_0, v_0, h_1, v_1, ...
+                vector<double> stateValues;
+                while (getline(ss, cell, ',')) {
+                    stateValues.push_back(stod(cell));
+                }
+                for (int i = 0; i < N && (2 * i + 1) < static_cast<int>(stateValues.size()); i++) {
+                    fifthFile << i << "," << i * SimulationParameters.dz << ","
+                              << stateValues[2 * i] << "," << stateValues[2 * i + 1] << "\n";
+                }
+                break;
+            }
+        }
+    }
+    fifthFile.close();
+    inFile.close();
 
     return 0;
 }
