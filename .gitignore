@@ -6,3 +6,4 @@ main
 
 # IDE / OS files
 .DS_Store
+.venv/

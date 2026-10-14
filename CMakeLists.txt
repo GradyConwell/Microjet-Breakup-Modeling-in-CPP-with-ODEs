@@ -10,3 +10,4 @@ find_package(heyoka REQUIRED)
 
 add_executable(microjet main.cpp)
 target_link_libraries(microjet PRIVATE heyoka::heyoka)
+target_compile_options(microjet PRIVATE -O2)
