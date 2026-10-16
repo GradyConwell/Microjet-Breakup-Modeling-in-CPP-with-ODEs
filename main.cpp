@@ -24,6 +24,7 @@ struct PhysicalParameters {
     const double amp = 0.05;     // amplitude of initial perturbation
     const double f = 32849.33;   // optimum Rayleigh frequency (v0 / lambda_opt) in Hz
 } PhysicalParameters;
+// create an object to hold the physical parameters
 const auto [rho, gamma, mu, h0, v0, amp, f] = PhysicalParameters;
 
 struct SimulationParameters {
@@ -62,7 +63,79 @@ vector<double> getInitialValues() {
     return initValues;
 }
 
-int main() {
+// A detached child droplet, approximated as a point with volume, velocity and position.
+struct Droplet {
+    double volume;   // m^3
+    double velocity; // m/s (axial)
+    double position; // m (axial, centroid)
+    double time;     // s (creation time)
+};
+
+// Steps 2-3 of pinch-off. Operates on the domain [0, lastNode].
+// finds the neck (min radius) and the contiguous thin region around it (h <= some threshold)
+// collects the neck + the fragment downstream of it (up to the next local minimum or the
+// domain end) into one point-like child droplet (volume, volume-weighted velocity/position)
+// closes the jet: lastNode moves to the node just upstream of the neck, and every node
+// beyond it is overwritten with the new boundary values so it stays finite (it is frozen later)
+// Returns false (state untouched) if the pinch-off can't be performed.
+bool performPinchoff(vector<double>& state, int& lastNode, double threshold, double t, vector<Droplet>& droplets) {
+    // pull in grid spacing from the global object SimulationParameters
+    const double dz = SimulationParameters.dz;
+
+    // Helper functions to return values at a given node (i)
+    auto hAt = [&](int i) { return state[2 * i]; };
+    auto vAt = [&](int i) { return state[2 * i + 1]; };
+
+    // find neck = minimum radius in the interior nodes (exclude node 0 and lastNode)
+    int k = 1;
+    for (int i = 1; i < lastNode; i++) if (hAt(i) < hAt(k)) k = i;
+
+    // find extent of the thin neck region (nodes included), and map into neckHi, neckLo.
+    int neckLo = k, neckHi = k; 
+    while (neckLo > 1 && hAt(neckLo - 1) <= threshold) neckLo--;
+    while (neckHi < lastNode - 1 && hAt(neckHi + 1) <= threshold) neckHi++;
+
+    // find the end of the fragment, and map into dropEnd.
+    int dropEnd = lastNode;
+    for (int i = neckHi + 1; i < lastNode; i++) {
+        if (hAt(i) <= hAt(i - 1) && hAt(i) <= hAt(i + 1)) { dropEnd = i; break; }
+    }
+
+    // store the new last node that describes the jet. (1 less than the pinched regions lower bound)
+    int newLast = neckLo - 1;
+
+    // check if not enough jet left upstream (prevent negative last node)
+    // shouldn't ever be invoked unless simulation was setup wrong.
+    if (newLast < 2) return false;
+
+    // redistribute neck + fragment volume into one droplet
+    // create all my entries, loop through, and collect all the mass and momentum from each node.
+    double volume = 0.0, momentum = 0.0, moment = 0.0;
+    for (int i = neckLo; i <= dropEnd; i++) {
+        double dV = PI * hAt(i) * hAt(i) * dz;
+        volume += dV;
+        momentum += dV * vAt(i);
+        moment += dV * i * dz;
+    }
+
+    // add the droplet to the list
+    droplets.push_back({volume, momentum / volume, moment / volume, t});
+
+    // close the jet at the new boundary; freeze everything past it at finite values 
+    // at the end of the live region, assign values from the closest node in the live region
+    for (int i = newLast + 1; i < SimulationParameters.Nodes; i++) {
+        state[2 * i] = hAt(newLast); // radius
+        state[2 * i + 1] = vAt(newLast); // velocity
+    }
+
+    // update the last node in the jet domain to the new pinched off value.
+    lastNode = newLast;
+    return true;
+}
+
+// Builds the ODE system for the live domain [0, lastNode].
+// Node 0 is held fixed, lastNode is an outflow boundary, nodes beyond lastNode are frozen.
+vector<pair<expression, expression>> buildODEs(int lastNode) {
     // Create state variables for each nodes in the domain
     // let h be the jet radius at each node, and v be the axial velocity at each node
     vector<expression> h(SimulationParameters.Nodes), v(SimulationParameters.Nodes);
@@ -96,7 +169,7 @@ int main() {
     // so curvature and the ODEs below reuse the same expressions.
     vector<expression> hP(SimulationParameters.Nodes), hPP(SimulationParameters.Nodes);
     vector<expression> vP(SimulationParameters.Nodes), vPP(SimulationParameters.Nodes);
-    for (int i = 1; i < SimulationParameters.Nodes - 1; i++) {
+    for (int i = 1; i < lastNode; i++) {
         hP[i] = d1(h, i);
         hPP[i] = d2(h, i);
         vP[i] = d1(v, i);
@@ -122,15 +195,15 @@ int main() {
     
     // create curvature vector for all points i (excluding boundaries)
 
-    for (int i = 1; i < SimulationParameters.Nodes - 1; i++) {
+    for (int i = 1; i < lastNode; i++) {
         C[i] = curvature(h, i);
     }
     // boundaries are "closed" to not influence the interior flow (ie, not changing at edges)
     // first node is equal to the second node
     C[0] = C[1];
 
-    // last node is equal to the second to last node
-    C[SimulationParameters.Nodes - 1] = C[SimulationParameters.Nodes - 2];
+    // last live node is equal to the one before it
+    C[lastNode] = C[lastNode - 1];
 
     // Create ODEs for Heyoka
     vector<pair<expression,expression>> odes;
@@ -141,7 +214,7 @@ int main() {
 
     // Nodes
     // interior nodes only: stencils need i-1 and i+1
-    for (int i = 1; i < N-1; i++){
+    for (int i = 1; i < lastNode; i++){
         // set up terms of equations.
         // patterned in stencils above.
         auto hp = hP[i]; // h prime
@@ -162,28 +235,44 @@ int main() {
         odes.push_back({v[i], dvdt});
     }
 
-    // Boundary Node N-1 (outflow)
+    // Boundary Node lastNode (outflow)
     // values are carried out of the domain by the flow: upwind difference with the node before it
-    odes.push_back({h[N-1], -v[N-1] * (h[N-1] - h[N-2]) / SimulationParameters.dz});
-    odes.push_back({v[N-1], -v[N-1] * (v[N-1] - v[N-2]) / SimulationParameters.dz});
+    odes.push_back({h[lastNode], -v[lastNode] * (h[lastNode] - h[lastNode - 1]) / SimulationParameters.dz});
+    odes.push_back({v[lastNode], -v[lastNode] * (v[lastNode] - v[lastNode - 1]) / SimulationParameters.dz});
 
-    // Create integrator object
-    // taylor_adaptive<type>{expressions, initial values}
-    
-    // get initial values for integrator
-    vector<double> initValues = getInitialValues();
-   
-    // Build the integrator (slow)
-    // type = taylor_adaptive
-    // tol = 1e-9
-    // compact_mode = true
-    // opt_level = 1
+    // Frozen nodes beyond the pinch-off point (removed from the live jet)
+    for (int i = lastNode + 1; i < N; i++) {
+        odes.push_back({h[i], expression(0.0)});
+        odes.push_back({v[i], expression(0.0)});
+    }
+
+    return odes;
+}
+
+// Build the integrator (slow)
+// Create integrator object
+// taylor_adaptive<type>{expressions, initial values}
+taylor_adaptive<double> buildIntegrator(const vector<pair<expression, expression>>& odes,
+                                        const vector<double>& state, double t) {
     cout << "Building integrator" << endl;
     clock_t buildStart = clock();
-    auto ta = taylor_adaptive<double>{odes, initValues, kw::tol = 1e-9, kw::compact_mode = true, kw::opt_level = 1u};
-    clock_t buildEnd = clock();
-    double buildSeconds = double(buildEnd - buildStart) / CLOCKS_PER_SEC;
+    auto ta = taylor_adaptive<double>{odes, state, kw::tol = 1e-9, kw::compact_mode = true, kw::opt_level = 1u};
+    ta.set_time(t);
+    double buildSeconds = double(clock() - buildStart) / CLOCKS_PER_SEC;
     cout << "Build time: " << buildSeconds << " s, Taylor order: " << ta.get_order() << endl;
+    return ta;
+}
+
+int main() {
+    // domain is nodes [0, lastNode]; shrinks at each pinch-off
+    int lastNode = N - 1;
+    vector<Droplet> droplets;
+    auto odes = buildODEs(lastNode);
+
+    // get initial values for integrator
+    vector<double> initValues = getInitialValues();
+
+    auto ta = buildIntegrator(odes, initValues, 0.0);
 
     // Integrate
     double initialTime = 0; // initial time
@@ -222,12 +311,13 @@ int main() {
         vector<double> currentState = ta.get_state();
 
         // Check minimum radius to detect state prior to breakup
-        double min_h = currentState[0];
+        // only the live interior [1, lastNode - 1] is checked for the neck
+        double min_h = currentState[2];
         bool has_nan = false;
         for (int i = 0; i < N; i++) {
             double hi = currentState[2 * i];
             if (std::isnan(hi)) { has_nan = true; break; }
-            if (hi < min_h) min_h = hi;
+            if (i >= 1 && i < lastNode && hi < min_h) min_h = hi;
         }
 
         // Check to see if the math has broken.
@@ -242,16 +332,23 @@ int main() {
         file << "\n";
         file.flush();
 
-        //if jet has developed deep neck right prior to breakup (pinch-off)
+        // if jet has developed deep neck prior to breakup (pinch-off)
         if (min_h <= 5.0e-6) {
-            cout << "Breakup: h_min = " << min_h * 1e6
-                 << " µm at t = " << t * 1e6 << " µs." << endl;
+            cout << "Breakup: h_min = " << min_h * 1e6 << " µm at t = " << t * 1e6 << " µs." << endl;
             // perform pinchoff operations
-            // 1. stop time integration
-            // 2. redistribute neck volume, and create a child droplet. Each droplet be approximated as a simple point with some volume v, velocity v, and position f(z).
-            // 3. close the slender jet to the new boundary at the pinch-off point
-            // 4. recalculate the integrator
-            // 5. continue stepping
+            // 1. stop time integration (propagate_until has returned; nothing is stepping)
+            // 2-3. redistribute neck volume into a child droplet (point: volume, velocity, position)
+            // close the slender jet at the new boundary at the pinch-off point
+            if (performPinchoff(currentState, lastNode, 5.0e-6, t, droplets)) {
+                const Droplet& d = droplets.back();
+                cout << "Droplet #" << droplets.size() << ": V = " << d.volume
+                     << " m^3, v = " << d.velocity << " m/s, z = " << d.position * 1e6
+                     << " µm. Jet now ends at node " << lastNode << endl;
+                // 4. recalculate the integrator from the current state and time
+                odes = buildODEs(lastNode);
+                ta = buildIntegrator(odes, currentState, t);
+                // 5. continue stepping (the loop continues with the new integrator)
+            }
         }
 
         nextSample += sampleTime;
