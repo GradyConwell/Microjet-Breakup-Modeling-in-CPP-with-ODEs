@@ -124,8 +124,8 @@ bool performPinchoff(vector<double>& state, int& lastNode, double threshold, dou
     // close the jet at the new boundary; freeze everything past it at finite values 
     // at the end of the live region, assign values from the closest node in the live region
     for (int i = newLast + 1; i < SimulationParameters.Nodes; i++) {
-        state[2 * i] = hAt(newLast); // radius
-        state[2 * i + 1] = vAt(newLast); // velocity
+        state[2 * i] = 0.00; // radius
+        state[2 * i + 1] = 0.00; // velocity
     }
 
     // update the last node in the jet domain to the new pinched off value.
@@ -264,11 +264,11 @@ taylor_adaptive<double> buildIntegrator(const vector<pair<expression, expression
 }
 
 int main() {
+    clock_t mainStart = clock();
     // domain is nodes [0, lastNode]; shrinks at each pinch-off
     int lastNode = N - 1;
     vector<Droplet> droplets;
     auto odes = buildODEs(lastNode);
-
     // get initial values for integrator
     vector<double> initValues = getInitialValues();
 
@@ -288,8 +288,27 @@ int main() {
     tm* ltm = localtime(&now);
     string date = to_string(ltm->tm_mon + 1) + "-" + to_string(ltm->tm_mday) + "-" + to_string(ltm->tm_year + 1900);
 
+    // ---------------------------
     // Integrate until final time
-    string filename = "microjet" + date + ".csv";
+    // ---------------------------
+
+    // Check for any existing files:
+    bool existing = false;
+    ifstream testFile("microjet" + date + ".csv"); 
+    if (testFile.is_open()) {
+        existing = true;
+        testFile.close();
+    }
+
+    // Create file
+    string filename;    
+    if (existing == false){
+        filename = "microjet" + date + ".csv";
+    }
+    else {
+        filename = "microjet" + date + "_" + to_string(clock()) + ".csv";
+    }
+
     initCSV(filename);
 
     // open CSV once (state is ordered h_0, v_0, h_1, v_1, ...)
@@ -356,52 +375,6 @@ int main() {
     clock_t stepEnd = clock();
     double stepSeconds = double(stepEnd - stepStart) / CLOCKS_PER_SEC;
     cout << "Total integration time: " << stepSeconds << " s" << endl;
-
-    // write the last frame in "long" format
-    // columns: node, z, h, v   (z is implied by the node index: z = node * dz)
-    ofstream lastFile("microjet_last_frame.csv");
-    lastFile << setprecision(17);
-    lastFile << "node,z,h,v" << endl;
-    vector<double> lastState = ta.get_state();
-    for (int i = 0; i < N; i++) {
-        lastFile << i << "," << i * SimulationParameters.dz << "," << lastState[2*i] << "," << lastState[2*i + 1] << "\n";
-    }
-
-    file.close();
-
-    // write the fifth frame in long format from the microjetDATE.csv file
-    // read microjetDATE.csv, find the row at t = 5 * sampleTime (5.0e-6 s), and write it to a new CSV
-    ifstream inFile(filename);
-    ofstream fifthFile("microjet_5th_frame.csv");
-    fifthFile << setprecision(16);
-    fifthFile << "node,z,h,v\n";
-
-    double targetTime = 5 * sampleTime; // 5 µs
-    string line;
-    // Skip header line
-    if (getline(inFile, line)) {
-        while (getline(inFile, line)) {
-            stringstream ss(line);
-            string cell;
-            if (!getline(ss, cell, ',')) continue;
-            
-            double rowTime = stod(cell);
-            if (abs(rowTime - targetTime) < 0.5 * sampleTime) {
-                // Parse the state values: h_0, v_0, h_1, v_1, ...
-                vector<double> stateValues;
-                while (getline(ss, cell, ',')) {
-                    stateValues.push_back(stod(cell));
-                }
-                for (int i = 0; i < N && (2 * i + 1) < static_cast<int>(stateValues.size()); i++) {
-                    fifthFile << i << "," << i * SimulationParameters.dz << ","
-                              << stateValues[2 * i] << "," << stateValues[2 * i + 1] << "\n";
-                }
-                break;
-            }
-        }
-    }
-    fifthFile.close();
-    inFile.close();
-
+    cout << "Total elapsed time: " << double(clock() - mainStart) / CLOCKS_PER_SEC << " s" << endl;
     return 0;
 }
