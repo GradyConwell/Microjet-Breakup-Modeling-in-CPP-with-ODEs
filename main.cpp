@@ -45,6 +45,23 @@ void initCSV(const string& filename) {
     file.close();
 }
 
+vector<double> getInitialValues() {
+    // create empty vector of initial values
+    vector<double> initValues(2 * SimulationParameters.Nodes);
+    // populate vector with initial conditions
+    for (int i = 0; i < SimulationParameters.Nodes; i++) {
+        double z = (i - 0.5) * SimulationParameters.dz;
+        // modulation of "nozzle radius" to perturb the jet
+        double hInit = h0 * (1 + amp * sin(2 * PI * z * f / v0));
+        // maintain constant flowrate thru nozzle 
+        double vInit = v0 * pow(h0, 2) / pow(hInit, 2);
+        // Store in array
+        initValues[2 * i] = hInit;
+        initValues[2 * i + 1] = vInit;
+    }
+    return initValues;
+}
+
 int main() {
     // Create state variables for each nodes in the domain
     // let h be the jet radius at each node, and v be the axial velocity at each node
@@ -67,7 +84,6 @@ int main() {
     auto d1 = [&](vector<expression>& u, int i) {
         return (u[i + 1] - u[i - 1]) / (2.0 * SimulationParameters.dz);
     };
-    // create second derivative stencil
     // 2OCD
     auto d2 = [&](vector<expression>& u, int i) {
         return (u[i + 1] - 2.0 * u[i] + u[i - 1]) / (SimulationParameters.dz * SimulationParameters.dz);
@@ -153,17 +169,9 @@ int main() {
 
     // Create integrator object
     // taylor_adaptive<type>{expressions, initial values}
-    vector<double> initValues(2 * SimulationParameters.Nodes);
-    for (int i = 0; i < SimulationParameters.Nodes; i++) {
-        double z = i * SimulationParameters.dz;
-        // modulation of "nozzle radius" to perturb the jet
-        double hInit = h0*(1 + amp*sin(2 * PI * z * f / v0));
-        // maintain constant flowrate thru nozzle 
-        double vInit = v0 * pow(h0, 2) / pow(hInit, 2);
-        // Store in array
-        initValues[2*i] = hInit;
-        initValues[2*i + 1] = vInit;
-    }
+    
+    // get initial values for integrator
+    vector<double> initValues = getInitialValues();
    
     // Build the integrator (slow)
     // type = taylor_adaptive
@@ -172,7 +180,7 @@ int main() {
     // opt_level = 1
     cout << "Building integrator" << endl;
     clock_t buildStart = clock();
-    auto ta = taylor_adaptive<double>{odes, initValues, kw::tol = 1e-12, kw::compact_mode = true, kw::opt_level = 1u};
+    auto ta = taylor_adaptive<double>{odes, initValues, kw::tol = 1e-9, kw::compact_mode = true, kw::opt_level = 1u};
     clock_t buildEnd = clock();
     double buildSeconds = double(buildEnd - buildStart) / CLOCKS_PER_SEC;
     cout << "Build time: " << buildSeconds << " s, Taylor order: " << ta.get_order() << endl;
@@ -197,7 +205,7 @@ int main() {
 
     // open CSV once (state is ordered h_0, v_0, h_1, v_1, ...)
     ofstream file(filename, ios::app);
-    file << setprecision(17);
+    file << setprecision(16);
 
     // write initial state
     file << t;
@@ -222,8 +230,9 @@ int main() {
             if (hi < min_h) min_h = hi;
         }
 
+        // Check to see if the math has broken.
         if (has_nan) {
-            cout << "Encountered non-finite values at t = " << t * 1e6 << " µs, halting." << endl;
+            cout << "Non-finite values at t = " << t * 1e6 << " µs, halting." << endl;
             break;
         }
 
@@ -233,11 +242,16 @@ int main() {
         file << "\n";
         file.flush();
 
-        // Break if jet has developed deep neck right prior to breakup (pinch-off)
-        if (min_h <= 2.0e-6) {
-            cout << "Jet profile prior to breakup captured: h_min = " << min_h * 1e6
+        //if jet has developed deep neck right prior to breakup (pinch-off)
+        if (min_h <= 5.0e-6) {
+            cout << "Breakup: h_min = " << min_h * 1e6
                  << " µm at t = " << t * 1e6 << " µs." << endl;
-            break;
+            // perform pinchoff operations
+            // 1. stop time integration
+            // 2. redistribute neck volume, and create a child droplet. Each droplet be approximated as a simple point with some volume v, velocity v, and position f(z).
+            // 3. close the slender jet to the new boundary at the pinch-off point
+            // 4. recalculate the integrator
+            // 5. continue stepping
         }
 
         nextSample += sampleTime;
@@ -262,7 +276,7 @@ int main() {
     // read microjetDATE.csv, find the row at t = 5 * sampleTime (5.0e-6 s), and write it to a new CSV
     ifstream inFile(filename);
     ofstream fifthFile("microjet_5th_frame.csv");
-    fifthFile << setprecision(17);
+    fifthFile << setprecision(16);
     fifthFile << "node,z,h,v\n";
 
     double targetTime = 5 * sampleTime; // 5 µs
