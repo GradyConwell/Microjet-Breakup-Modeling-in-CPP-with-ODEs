@@ -3,6 +3,7 @@
 *.dSYM/
 microjet
 main
+assets/monogram-black.png
 
 # IDE / OS files
 .DS_Store

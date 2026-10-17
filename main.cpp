@@ -1,445 +1,343 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <cmath>
-#include <iomanip>
-#include <numeric>
+// Grady Conwell, 2026
+// 
+// Rayleigh breakup of a 18.5 µm microjet, after Van Hoeve et al. (2010), "Breakup of diminutive Rayleigh jets",
+// using the slender-jet (lubrication) equations of Eggers & Dupont, J. Fluid Mech. 262, 205 (1994).
+//
+// lengths in h0, time in the capillary time tc = sqrt(rho h0^3 / gamma).
+// The jet is written in terms of a = h^2, which keeps the equations regular at a rounded tip (h -> 0):
+//   a_t + (a v)'  = 0
+//   (a v)_t + (a v^2)' = G' + 3 Oh (a v')',   G = h^2 K = a^2 (1 + a''/2) / (a + a'^2/4)^(3/2)
+// G is the axial surface-tension force on a cross-section (divided by pi gamma h0), so both equations
+// conserve mass and momentum exactly.
+//
+// N cells spread evenly from the nozzle (z = 0) to the jet tip (z = L), so z = xi L(t).
+// Cell centres hold a, cell faces hold v (staggered), and the tip moves with the fluid: dL/dt = v_tip.
+// Pinch-off: when the neck radius drops below 100 nm, the part downstream becomes a droplet
+// and the remaining jet is redistributed over the N cells. A free droplet's centre of mass moves at constant
+// velocity (no gravity or air interaction is modeled), so detached drops are carried as (volume, momentum). Objects that touch
+// (gap < 0.005 h0) while approaching coalesce. A drop caught by the jet tip is absorbed into the tip cells.
+//
+// VARIABLE DICTIONARY   [dimensionless] unless SI units are given. Scales: length h0, time tc, velocity uc.
+// ---------------------------------------------------------------------------------------------------------
+// Physical inputs (SI)
+//   rho        Liquid density [kg/m^3]
+//   gam        Surface tension gamma [N/m]
+//   mu         Dynamic viscosity [Pa s]
+//   h0         Unperturbed jet radius [m]; the length scale
+//   vjet       Jet velocity at the nozzle [m/s]
+//   delta      Nozzle radius modulation amplitude, as a fraction of h0 (paper: 0.005)
+//
+// Scales and dimensionless groups
+//   tc         Capillary time sqrt(rho h0^3 / gam) [s]; the time scale (~10 µs)
+//   uc         Velocity scale h0 / tc [m/s]
+//   Oh         Ohnesorge number mu / sqrt(rho gam h0): viscosity vs. inertia and surface tension (~0.10)
+//   U          Dimensionless jet velocity vjet / uc = sqrt(We)
+//   omega      Angular nozzle forcing frequency 2 pi f, with f = vjet / lambda_opt
+//   PI         pi
+//
+// Numerical settings
+//   N          Number of grid cells from the nozzle to the jet tip
+//   hPinch     Pinch-off threshold radius (100 nm / h0)
+//   gapMerge   Gap below which approaching objects coalesce (0.005 h0)
+//   dtOut      Time between output frames (1 µs)
+//   tEnd       End time of the simulation (set from argv[1] in µs)
+//
+// Grid and state (z = xi L, xi in [0, 1]; cell j spans faces j and j + 1)
+//   s, x       State vector: x are its heyoka symbols, s its numerical values (s[i] is the value of x[i])
+//                s[0 .. N-1]     a_j: squared radius h^2 at cell centres
+//                s[iV .. iV+N-1] v_1 .. v_N: axial velocity at cell faces (v_N is the tip velocity)
+//                s[iL]           L: jet length, nozzle to tip
+//   iV, iL     Offsets of the velocities and of L in the state vector
+//   a, a(j)    Squared jet radius h^2 (a(-1) and a(N) are ghost cells for the nozzle and tip)
+//   h          Jet radius sqrt(a)
+//   v, v(k)    Axial velocity at face k (v(0) is the nozzle inflow velocity vn)
+//   L          Jet length (position of the tip)
+//   Ldot       dL/dt, the tip velocity (= v_N)
+//   dz         Cell width L / N
+//   j, k       Cell index, face index
+//
+// Nozzle boundary
+//   hn         Nozzle radius 1 + delta sin(omega t)
+//   an         Nozzle area term hn^2
+//   vn         Nozzle velocity U / an (keeps the flow rate constant, paper Eq. 9)
+//   nozzleA()  an evaluated numerically at a given time
+//
+// Equation terms (buildJet)
+//   ap, app    a' and a'' (first and second z-derivatives of a)
+//   d          a + a'^2 / 4, the denominator term of the curvature
+//   G[j]       Capillary tension h^2 K at cell j (axial surface-tension force / (pi gam h0))
+//   S[j]       Viscous tension a v' at cell j (multiplied by 3 Oh in the momentum equation)
+//   F[k]       Mass flux through face k, relative to the moving grid
+//   adv        Momentum advection term (v - grid velocity) v'
+//   force      Capillary + viscous force per unit mass at a face
+//   pinch      Terminal events that stop the integrator when any a_j falls to hPinch^2
+//   odes       (variable, d/dt) pairs passed to heyoka
+//   ta         heyoka Taylor integrator for the jet
+//
+// Drops (struct Drop)
+//   V          Drop volume
+//   P          Drop momentum V v
+//   z          Drop centre of mass at time t
+//   t          Reference time for z
+//   v()        Drop velocity P / V (constant: free drops feel no net force)
+//   R()        Equivalent sphere radius (3V / 4pi)^(1/3)
+//   at(time)   Centre of mass at the given time
+//   drops      All detached drops in flight
+//   p, q       Neighbouring drops (p behind q) checked for coalescence
+//
+// Pinch-off, absorption and remapping
+//   findNeck() Index of the thinnest local minimum below hMax that has a real bulge downstream, else -1
+//   hMax       Radius below which findNeck() accepts a neck
+//   bulge      Largest a seen downstream of the cell being tested
+//   best       Index of the thinnest neck found so far
+//   neck       Cell index of the current pinch-off neck (-1 if none)
+//   caught     Index in drops of a drop the jet tip has caught (-1 if none)
+//   pinches    Number of pinch-offs so far (event index in neck.csv)
+//   remap()    Redistributes the N cells over a new jet length by linear interpolation
+//   Lnew       New length of the slender jet after a pinch-off
+//   aAt, vAt   Interpolate a (cell centres) and v (faces) of the old grid at a position z
+//   p          Fractional grid index used for interpolation
+//   dV         Volume of one cell added to a new drop
+//   n          Number of tip cells that receive an absorbed drop
+//   dA         Increase in a for each of those cells
+//   aOld       a of a tip cell before absorption (to weight the face velocity)
+//
+// Output and bookkeeping
+//   um, us     Conversion factors to µm and µs for output
+//   tOut       Time of the next output frame
+//   onStep     Callback after every integrator step: logs the neck radius and checks for drops the tip has caught
+//   dir        Output folder results/<YYYYMMDD_HHMMSS>
+//   jetCsv     jet.csv: t, L and h at every cell centre, one row per frame
+//   dropCsv    drops.csv: t, z, R, v of every drop in flight, per frame
+//   eventCsv   events.csv: every pinch-off and absorption
+//   neckCsv    neck.csv: minimum neck radius after every step (for the Fig. 6 power law)
+// ---------------------------------------------------------------------------------------------------------
+
 #include <algorithm>
-#include <fstream>
+#include <chrono>
 #include <ctime>
+#include <cmath>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <iostream>
 #include <numbers>
+#include <vector>
 #include <heyoka/heyoka.hpp>
 
 using namespace std;
 using namespace heyoka;
-
-// Simulation parameters from Van Hoeve et al. (2010), Section III.A
-// 40% w/w glycerol-saline solution (18.5 µm microjet)
-struct PhysicalParameters {
-    const double rho = 1098.0;   // density of 40% glycerol-saline in kg / m^3
-    const double gamma = 0.0679; // surface tension in N / m
-    const double mu = 0.00365;   // dynamic viscosity in Pa * s
-    const double h0 = 18.5e-6;   // initial jet radius in m
-    const double v0 = 5.4;       // initial jet velocity in m / s
-    const double amp = 0.05;     // amplitude of initial perturbation
-    const double f = v0 / (2.0 * sqrt(2.0) * numbers::pi * h0); // optimum Rayleigh frequency (v0 / lambda_opt) in Hz
-} PhysicalParameters;
-// create an object to hold the physical parameters
-const auto [rho, gamma, mu, h0, v0, amp, f] = PhysicalParameters;
-
-struct SimulationParameters {
-    const int Nodes = 1e3; // number of grid nodes
-    const double Length = 700e-6; // domain length: 700 µm
-    const double dz = Length / (Nodes - 1); // grid spacing
-} SimulationParameters;
-const int N = SimulationParameters.Nodes;
 constexpr double PI = numbers::pi;
 
-void initCSV(const string& filename) {
-    // open file
-    ofstream file(filename);
-    // write header
-    file << "t";
-    for (int i = 0; i < N; i++) file << ",h_" << i << ",v_" << i;
-    file << endl;
-    // close file
-    file.close();
-}
+// 40% w/w glycerol-saline microjet, Van Hoeve et al. (2010) Sec. III.A
+const double rho = 1098.0, gam = 0.0679, mu = 3.65e-3; // kg/m^3, N/m, Pa s
+const double h0 = 18.5e-6, vjet = 5.4;                 // m, m/s
+const double delta = 0.005;                            // nozzle modulation amplitude, delta / h0
 
-vector<double> getInitialValues() {
-    // create empty vector of initial values
-    vector<double> initValues(2 * SimulationParameters.Nodes, 0.0);
-    // populate vector with initial conditions: hemispherical volume at z=0, not a pre-existing jet
-    for (int i = 0; i < SimulationParameters.Nodes; i++) {
-        double z = i * SimulationParameters.dz;
-        if (z < h0) {
-            double hInit = sqrt(max(0.0, h0 * h0 - z * z));
-            double vInit = v0;
-            initValues[2 * i] = hInit;
-            initValues[2 * i + 1] = vInit;
-        } else {
-            initValues[2 * i] = 0.0;
-            initValues[2 * i + 1] = 0.0;
-        }
-    }
-    return initValues;
-}
+// Scales and dimensionless groups
+const double tc = sqrt(rho * h0 * h0 * h0 / gam); // capillary time, ~10 µs
+const double uc = h0 / tc;                        // velocity scale
+const double Oh = mu / sqrt(rho * gam * h0);      // ~0.10
+const double U = vjet / uc;                       // sqrt(We) ~ 2.95
+const double omega = U / sqrt(2.0);               // 2 pi f with f = vjet / lambda_opt, lambda_opt = 2 sqrt(2) pi h0
 
-// A detached child droplet, approximated as a point with volume, velocity and position.
-struct Droplet {
-    double volume;   // m^3
-    double velocity; // m/s (axial)
-    double position; // m (axial, centroid)
-    double time;     // s (creation time)
+// Simulation parameters
+const int N = 1000;                       // grid points, nozzle to tip (as in the paper). Changed from a global system with nodes that are fixed in space.
+const double hPinch = 100e-9 / h0;        // pinch-off threshold, 100 nm. (much lower than before, singularity issues addressed)
+const double gapMerge = 0.005;            // coalescence distance, 0.005 h0
+const double dtOut = 1e-6 / tc;           // 1 µs frames (Data output resolution)
+double tEnd = 400e-6 / tc;                // override with ./microjet <t_end in µs>
 
-    double radius() const { return cbrt(3.0 * volume / (4.0 * PI)); }
+struct Drop {
+    double V, P, z, t; // volume, momentum (V v), centre at time t
+    double v() const { return P / V; }
+    double R() const { return cbrt(3.0 * V / (4.0 * PI)); }
+    double at(double time) const { return z + v() * (time - t); }
 };
 
-// Advance each detached droplet along the axial direction and handle coalescence (Van Hoeve et al., 2010, Sec. II)
-void advanceDroplets(vector<Droplet>& droplets, double dt, double currentTime = -1.0, double z_tip = -1.0) {
-    for (auto& d : droplets) {
-        if (currentTime < 0.0 || d.time < currentTime) {
-            d.position += d.velocity * dt;
-        }
-    }
+// State layout: a_0..a_{N-1} (cells), v_1..v_N (faces, v_N = tip), L.
+const int iV = N, iL = 2 * N;
+double nozzleA(double t) { double hn = 1.0 + delta * sin(omega * t); return hn * hn; }
 
-    const double critDist = 0.005 * h0;
+taylor_adaptive<double> buildJet(vector<double> init) {
+    vector<expression> x(2 * N + 1);
+    for (int i = 0; i <= 2 * N; i++) x[i] = make_vars("x" + to_string(i));
 
-    // Remove recoiling microdroplets that re-enter the continuous jet tip
-    if (z_tip > 0.0) {
-        erase_if(droplets, [&](const Droplet& d) {
-            return d.velocity < 0.0 && (d.position - d.radius()) <= (z_tip + critDist);
-        });
-    }
+    // Nozzle: h = h0 (1 + delta sin wt) with constant flow rate, v = vjet h0^2 / h^2 (paper, Eqs. 8-9)
+    auto hn = 1.0 + delta * sin(omega * heyoka::time);
+    auto an = hn * hn, vn = U / an;
+    auto L = x[iL], Ldot = x[iV + N - 1], dz = L / double(N);
+    // Ghost cells pin a = a_nozzle at z = 0 and a = 0 at the tip
+    auto a = [&](int j) { return j < 0 ? 2.0 * an - x[0] : j >= N ? -x[N - 1] : x[j]; };
+    auto v = [&](int k) { return k == 0 ? vn : x[iV + k - 1]; };
 
-    // Coalesce overlapping micro/satellite droplets (excluding primary-satellite merging per Fig. 5 caption)
-    const double primaryRadiusCutoff = 0.8 * h0;
-    // switch to size_t since droplets.size() outputs type size_t
-    for (size_t i = 0; i < droplets.size(); ++i) {
-        for (size_t j = i + 1; j < droplets.size(); ) {
-            double r1 = droplets[i].radius(), r2 = droplets[j].radius();
-            bool bothPrimary = (r1 >= primaryRadiusCutoff && r2 >= primaryRadiusCutoff);
-            bool bothSub = (r1 < primaryRadiusCutoff && r2 < primaryRadiusCutoff);
-            if ((bothPrimary || bothSub) && abs(droplets[i].position - droplets[j].position) <= (r1 + r2 + critDist)) {
-                double V = droplets[i].volume + droplets[j].volume;
-                droplets[i].velocity = (droplets[i].volume * droplets[i].velocity + droplets[j].volume * droplets[j].velocity) / V;
-                droplets[i].position = (droplets[i].volume * droplets[i].position + droplets[j].volume * droplets[j].position) / V;
-                droplets[i].volume = V;
-                droplets[i].time = min(droplets[i].time, droplets[j].time);
-                droplets.erase(droplets.begin() + j);
-            } else {
-                ++j;
-            }
-        }
+    vector<expression> G(N), S(N), F(N + 1);
+    for (int j = 0; j < N; j++) {
+        auto ap = (a(j + 1) - a(j - 1)) / (2.0 * dz), app = (a(j + 1) - 2.0 * a(j) + a(j - 1)) / (dz * dz);
+        auto d = a(j) + 0.25 * ap * ap;
+        G[j] = a(j) * a(j) * (1.0 + 0.5 * app) / (d * sqrt(d)); // capillary tension
+        S[j] = a(j) * (v(j + 1) - v(j)) / dz;                     // viscous tension / 3 Oh
     }
+    F[0] = an * vn; // inflow
+    F[N] = expression(0.0); // the tip moves with the fluid
+    for (int k = 1; k < N; k++) F[k] = 0.5 * (a(k - 1) + a(k)) * (v(k) - (double(k) / N) * Ldot);
+
+    vector<pair<expression, expression>> odes;
+    for (int j = 0; j < N; j++) odes.push_back({x[j], -(F[j + 1] - F[j]) / dz - a(j) * Ldot / L});
+    for (int k = 1; k < N; k++) {
+        auto adv = (v(k) - (double(k) / N) * Ldot) * (v(k + 1) - v(k - 1)) / (2.0 * dz);
+        auto force = (G[k] - G[k - 1] + 3.0 * Oh * (S[k] - S[k - 1])) / (0.5 * (a(k - 1) + a(k)) * dz);
+        odes.push_back({x[iV + k - 1], force - adv});
+    }
+    // Tip: the last half cell is pulled back by the tension of its neighbour (zero area, zero force at the tip)
+    odes.push_back({x[iV + N - 1], -(G[N - 1] + 3.0 * Oh * S[N - 1]) / (0.5 * a(N - 1) * dz)});
+    odes.push_back({L, Ldot});
+
+    // Terminal events stop the integrator exactly when a cell reaches the pinch-off radius
+    vector<taylor_adaptive<double>::t_event_t> pinch;
+    for (int j = 3; j < N - 3; j++) pinch.emplace_back(x[j] - hPinch * hPinch, kw::direction = event_direction::negative);
+    return taylor_adaptive<double>{odes, std::move(init), kw::tol = 1e-10, kw::compact_mode = true, kw::t_events = pinch};
 }
 
-// Steps 2-3 of pinch-off. Operates on the domain [0, lastNode].
-// finds the neck (min radius) and the contiguous thin region around it (h <= some threshold)
-// collects the neck + the fragment downstream of it (up to the next local minimum or the
-// domain end) into one point-like child droplet (volume, volume-weighted velocity/position)
-// closes the jet: lastNode moves to the node just upstream of the neck, and every node
-// beyond it is overwritten with the new boundary values so it stays finite (it is frozen later)
-// Returns false (state untouched) if the pinch-off can't be performed.
-bool performPinchoff(vector<double>& state, int& lastNode, double threshold, double t, vector<Droplet>& droplets) {
-    // pull in grid spacing from the global object SimulationParameters
-    const double dz = SimulationParameters.dz;
-
-    // Helper functions to return values at a given node (i)
-    auto hAt = [&](int i) { return state[2 * i]; };
-    auto vAt = [&](int i) { return state[2 * i + 1]; };
-
-    // find neck = minimum radius in the interior nodes (exclude node 0 and lastNode)
-    int k = 1;
-    for (int i = 1; i < lastNode; i++) if (hAt(i) < hAt(k)) k = i;
-
-    // find extent of the thin neck region (nodes included), and map into neckHi, neckLo.
-    int neckLo = k, neckHi = k; 
-    while (neckLo > 1 && hAt(neckLo - 1) <= threshold) neckLo--;
-    while (neckHi < lastNode - 1 && hAt(neckHi + 1) <= threshold) neckHi++;
-
-    // The severed fragment is the entire head downstream of the neck
-    int dropEnd = lastNode;
-
-    // store the new last node that describes the jet. (1 less than the pinched regions lower bound)
-    int newLast = neckLo - 1;
-
-    // check if not enough jet left upstream (prevent negative last node)
-    // shouldn't ever be invoked unless simulation was setup wrong.
-    if (newLast < 2) return false;
-
-    // redistribute neck + fragment volume into one droplet
-    // create all my entries, loop through, and collect all the mass and momentum from each node.
-    double volume = 0.0, momentum = 0.0, moment = 0.0;
-    for (int i = neckLo; i <= dropEnd; i++) {
-        double dV = PI * hAt(i) * hAt(i) * dz;
-        volume += dV;
-        momentum += dV * vAt(i);
-        moment += dV * i * dz;
-    }
-
-    if (volume <= 0.0) return false;
-
-    // add the droplet to the list
-    droplets.push_back({volume, momentum / volume, moment / volume, t});
-
-    // close the jet at the new boundary: smooth tip from upstream node so it does not retain singular neck
-    state[2 * newLast] = state[2 * (newLast - 1)];
-    state[2 * newLast + 1] = state[2 * (newLast - 1) + 1];
-
-    for (int i = newLast + 1; i < SimulationParameters.Nodes; i++) {
-        state[2 * i] = 0.00; // radius
-        state[2 * i + 1] = 0.00; // velocity
-    }
-
-    // update the last node in the jet domain to the new pinched off value.
-    lastNode = newLast;
-    return true;
+// Redistribute the grid over the jet [0, Lnew] (linear interpolation).
+void remap(double* s, double t, double Lnew) {
+    const double L = s[iL], dz = L / N;
+    vector<double> a(s, s + N), v(N + 1);
+    v[0] = U / nozzleA(t);
+    copy(s + iV, s + iV + N, v.begin() + 1);
+    auto aAt = [&](double z) { // cell centres, a = 0 at the tip
+        double p = z / dz - 0.5;
+        if (p <= 0) return a[0];
+        if (p >= N - 1) return max(0.0, a[N - 1] * (L - z) / (0.5 * dz));
+        int j = int(p); return a[j] + (p - j) * (a[j + 1] - a[j]);
+    };
+    auto vAt = [&](double z) { // faces
+        double p = min(z, L) / dz; int k = min(int(p), N - 1);
+        return v[k] + (p - k) * (v[k + 1] - v[k]);
+    };
+    for (int j = 0; j < N; j++) s[j] = aAt((j + 0.5) * Lnew / N);
+    for (int k = 1; k <= N; k++) s[iV + k - 1] = vAt(k * Lnew / N);
+    s[iL] = Lnew;
 }
 
-// Builds the ODE system for the live domain [0, lastNode].
-// Node 0 is held fixed, lastNode is an outflow boundary, nodes beyond lastNode are omitted (frozen at 0).
-vector<pair<expression, expression>> buildODEs(int lastNode) {
-    const int numActive = lastNode + 1;
-    // Create state variables only for the active nodes [0, lastNode]
-    vector<expression> h(numActive), v(numActive);
-
-    // Initialize each node as its own expression variable
-    for (int i = 0; i < numActive; i++) {
-        h[i] = make_vars("h_" + to_string(i));
-        v[i] = make_vars("v_" + to_string(i));
+// Neck: a local minimum of h below the threshold with a real bulge (drop) downstream of it.
+int findNeck(const double* s, double hMax) {
+    int best = -1;
+    double bulge = 0.0;
+    for (int j = N - 1; j > 2; j--) {
+        bulge = max(bulge, s[j]);
+        if (s[j] < hMax * hMax && s[j] <= s[j - 1] && s[j] <= s[j + 1] && j < N - 3 && bulge > 100.0 * hPinch * hPinch
+            && (best < 0 || s[j] < s[best]))
+            best = j;
     }
-
-    // https://en.wikipedia.org/wiki/Stencil_(numerical_analysis)
-    // Next step: create expressions for stencils IOT create set of solvable ODEs for heyoka
-
-    // stencils
-    // 1OCD
-    auto d1 = [&](vector<expression>& u, int i) {
-        return (u[i + 1] - u[i - 1]) / (2.0 * SimulationParameters.dz);
-    };
-    // 2OCD
-    auto d2 = [&](vector<expression>& u, int i) {
-        return (u[i + 1] - 2.0 * u[i] + u[i - 1]) / (SimulationParameters.dz * SimulationParameters.dz);
-    };
-
-    // smoothing coefficient (m^2/s), scaled to grid spacing and jet velocity
-    const double smooth = 0.1 * SimulationParameters.dz * v0;
-
-    // Build the stencils once per node and store them,
-    // so curvature and the ODEs below reuse the same expressions.
-    vector<expression> hP(numActive), hPP(numActive);
-    vector<expression> vP(numActive), vPP(numActive);
-    for (int i = 1; i < lastNode; i++) {
-        hP[i] = d1(h, i);
-        hPP[i] = d2(h, i);
-        vP[i] = d1(v, i);
-        vPP[i] = d2(v, i);
-    }
-
-    // calculate curvature at a node (C)
-    // pass in curvature(expression, index)
-    auto curvature = [&](vector<expression>& u, int i) {
-        auto hp = hP[i]; // h prime at i
-        auto hpp = hPP[i]; // h double prime at i
-        auto term1 = 1.0 + hp * hp; // (1 + (h')^2) term
-        auto sqrtTerm1 = sqrt(term1);
-        return 1.0 / (u[i] * sqrtTerm1) - hpp / (term1 * sqrtTerm1);
-    };
-
-    // calculate spatial derivative of curvature (C')
-    // uses the precomputed C vector (below) so boundary values C[0], C[lastNode] are respected
-    vector<expression> C(numActive);
-    auto dC = [&](int i) {
-        auto Cp = (C[i + 1] - C[i - 1]) / (2.0 * SimulationParameters.dz);
-        return Cp;
-    };
-    
-    // create curvature vector for all points i (excluding boundaries)
-
-    for (int i = 1; i < lastNode; i++) {
-        C[i] = curvature(h, i);
-    }
-    // boundaries are "closed" to not influence the interior flow (ie, not changing at edges)
-    // first node is equal to the second node
-    C[0] = C[1];
-
-    // last live node is equal to the one before it
-    C[lastNode] = C[lastNode - 1];
-
-    // Create ODEs for Heyoka
-    vector<pair<expression,expression>> odes;
-    odes.reserve(2 * numActive);
-
-    // Boundary Node 0: nozzle vibrates continuously in time
-    auto dh0_dt = h0 * amp * (2.0 * PI * f) * cos(2.0 * PI * f * heyoka::time);
-    auto dv0_dt = -2.0 * v0 * (h0 * h0) / (h[0] * h[0] * h[0]) * dh0_dt;
-    odes.push_back({h[0], dh0_dt});
-    odes.push_back({v[0], dv0_dt});
-
-    // Nodes
-    // interior nodes only: stencils need i-1 and i+1
-    for (int i = 1; i < lastNode; i++){
-        // set up terms of equations.
-        // patterned in stencils above.
-        auto hp = hP[i]; // h prime
-        auto vp = vP[i]; // v prime
-        auto vpp = vPP[i];// v double prime
-        auto Cp = dC(i); // C prime
-
-        // Two equations from paper:
-        auto dvdt = -v[i] * vp - (gamma / rho) * Cp + 3 * mu / rho * (vpp + 2.0 * hp / h[i] * vp);
-        auto dhdt = -v[i] * hp - 0.500 * h[i] * vp;
-
-        // smoothing. Just pave over the sawtooth behavior by running it over with the second derivative.
-        dvdt += smooth * vpp;
-        dhdt += smooth * hPP[i];
-
-        // store node in vectors
-        odes.push_back({h[i], dhdt});
-        odes.push_back({v[i], dvdt});
-    }
-
-    // Boundary Node lastNode (convective outflow at constant jet speed v0 so capillary recoil v < 0 remains upwind-stable)
-    odes.push_back({h[lastNode], -v0 * (h[lastNode] - h[lastNode - 1]) / SimulationParameters.dz});
-    odes.push_back({v[lastNode], -v0 * (v[lastNode] - v[lastNode - 1]) / SimulationParameters.dz});
-
-    return odes;
+    return best;
 }
 
-// Build the integrator (slow)
-// Create integrator object
-// taylor_adaptive<type>{expressions, initial values}
-taylor_adaptive<double> buildIntegrator(const vector<pair<expression, expression>>& odes,
-                                        const vector<double>& state, double t) {
-    cout << "Building integrator" << endl;
-    clock_t buildStart = clock();
-    vector<double> activeState(state.begin(), state.begin() + odes.size());
-    auto ta = taylor_adaptive<double>{odes, std::move(activeState), kw::tol = 1e-9, kw::compact_mode = true, kw::opt_level = 0u};
-    ta.set_time(t);
-    double buildSeconds = double(clock() - buildStart) / CLOCKS_PER_SEC;
-    cout << "Build time: " << buildSeconds << " s, Taylor order: " << ta.get_order() << endl;
-    return ta;
-}
+int main(int argc, char** argv) {
+    cout << unitbuf;
+    if (argc > 1) tEnd = stod(argv[1]) * 1e-6 / tc;
+    char stamp[32];
+    time_t now = std::time(nullptr);
+    strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", localtime(&now));
+    auto dir = filesystem::path("results") / stamp;
+    filesystem::create_directories(dir);
+    ofstream jetCsv(dir / "jet.csv"), dropCsv(dir / "drops.csv"), eventCsv(dir / "events.csv"), neckCsv(dir / "neck.csv");
+    jetCsv << "t_us,L_um";
+    for (int j = 0; j < N; j++) jetCsv << ",h" << j;
+    jetCsv << "\n";
+    dropCsv << "t_us,z_um,R_um,v_ms\n";
+    eventCsv << "t_us,type,z_um,R_um,v_ms\n";
+    neckCsv << "event,t_us,hmin_um" << endl;
+    jetCsv.flush(), dropCsv.flush(), eventCsv.flush(); // never leave an empty file (synced folders replace them)
+    const double um = h0 * 1e6, us = tc * 1e6;
 
-int main() {
-    clock_t mainStart = clock();
-    // domain starts at the hemispherical droplet (z < h0) and advances as the jet flows
-    int lastNode = 0;
-    while ((lastNode + 1) * SimulationParameters.dz < h0 && lastNode < N - 1) {
-        lastNode++;
-    }
-    double z_tip = lastNode * SimulationParameters.dz;
-    vector<Droplet> droplets;
-    auto odes = buildODEs(lastNode);
-    // get initial values for integrator
-    vector<double> currentState = getInitialValues();
+    cout << format("Oh = {:.4f}, We = {:.3f}, tc = {:.3f} us, f = {:.2f} kHz, N = {}\nOutput: {}\n",
+                   Oh, U * U, us, omega / (2 * PI) / tc * 1e-3, N, dir.string());
 
-    auto ta = buildIntegrator(odes, currentState, 0.0);
+    // Initial condition: hemispherical drop h = sqrt(h0^2 - z^2) at the nozzle, moving at vjet (paper, Sec. II)
+    vector<double> init(2 * N + 1, U);
+    for (int j = 0; j < N; j++) init[j] = 1.0 - pow((j + 0.5) / N, 2);
+    init[iL] = 1.0;
 
-    // Integrate
-    double initialTime = 0; // initial time
-    double finalTime = 400 * 1e-6; // 400 microseconds, final time
-    double sampleTime = 1 * 1e-6; // sample every microsecond
+    auto start = chrono::steady_clock::now();
+    auto ta = buildJet(init);
+    cout << format("Integrator built in {:.1f} s (order {})\n",
+                   chrono::duration<double>(chrono::steady_clock::now() - start).count(), ta.get_order());
 
-    // set initial time
-    ta.set_time(initialTime);
-    double t = ta.get_time();
+    vector<Drop> drops;
+    int pinches = 0, neck = -1, caught = -1;
+    auto onStep = [&](taylor_adaptive<double>& ta) {
+        const double* s = ta.get_state().data();
+        int j = findNeck(s, 0.5);
+        if (j >= 0) neckCsv << pinches << "," << ta.get_time() * us << "," << sqrt(s[j]) * um << "\n";
+        for (size_t i = 0; i < drops.size() && caught < 0; i++)
+            if (drops[i].at(ta.get_time()) - drops[i].R() - s[iL] < gapMerge && s[iV + N - 1] > drops[i].v()) caught = int(i);
+        return caught < 0;
+    };
 
-    // get date
-    time_t now = std::time(0);
-    tm* ltm = localtime(&now);
-    string date = to_string(ltm->tm_mon + 1) + "-" + to_string(ltm->tm_mday) + "-" + to_string(ltm->tm_year + 1900);
-
-    // ---------------------------
-    // Integrate until final time
-    // ---------------------------
-
-    // Check for any existing files:
-    bool existing = false;
-    ifstream testFile("microjet" + date + ".csv"); 
-    if (testFile.is_open()) {
-        existing = true;
-        testFile.close();
-    }
-
-    // Create file
-    string filename;    
-    if (existing == false){
-        filename = "microjet" + date + ".csv";
-    }
-    else {
-        filename = "microjet" + date + "_" + to_string(clock()) + ".csv";
-    }
-
-    initCSV(filename);
-
-    // open CSV once (state is ordered h_0, v_0, h_1, v_1, ...)
-    ofstream file(filename, ios::app);
-    file << setprecision(16);
-
-    // write initial state
-    file << t;
-    for (double x : currentState) file << "," << x;
-    file << "\n";
-
-    // Step to each sample time and write that row right away
-    // (instead of storing every adaptive step in memory)
-    clock_t stepStart = clock();
-    double nextSample = initialTime + sampleTime;
-    while (t < finalTime) {
-        ta.propagate_until(nextSample); // work until next checkpoint
-        t = ta.get_time();
-        const auto& activeState = ta.get_state();
-        copy(activeState.begin(), activeState.end(), currentState.begin());
-
-        // Check minimum radius to detect state prior to breakup
-        // check both h and v for non-finite values across active nodes [0, lastNode]
-        double min_h = currentState[2];
-        bool has_nan = false;
-        for (int i = 0; i <= lastNode; i++) {
-            double hi = currentState[2 * i];
-            double vi = currentState[2 * i + 1];
-            if (!std::isfinite(hi) || !std::isfinite(vi)) { has_nan = true; break; }
-            if (i >= 1 && i <= lastNode && hi < min_h) min_h = hi;
-        }
-
-        // Check to see if the math has broken.
-        if (has_nan) {
-            cout << "Non-finite values at t = " << t * 1e6 << " µs, halting." << endl;
+    for (double tOut = 0.0; tOut <= tEnd;) {
+        ta.propagate_until(tOut, kw::callback = onStep, kw::max_delta_t = dtOut);
+        double t = ta.get_time(), *s = ta.get_state_data();
+        neck = findNeck(s, hPinch * (1.0 + 1e-6));
+        if (!all_of(s, s + 2 * N + 1, [](double x) { return isfinite(x); }) || *min_element(s, s + N) <= 0.0) {
+            cout << format("Solver failed at t = {:.2f} us\n", t * us);
             break;
         }
-
-        // write row and flush
-        file << t;
-        for (double x : currentState) file << "," << x;
-        file << "\n";
-        file.flush();
-
-        // if jet has developed deep neck prior to breakup (pinch-off)
-        const double pinchThreshold = 1.5e-6;
-        if (min_h <= pinchThreshold) {
-            cout << "Breakup: h_min = " << min_h * 1e6 << " µm at t = " << t * 1e6 << " µs." << endl;
-            // perform pinchoff operations
-            // 1. stop time integration (propagate_until has returned; nothing is stepping)
-            // 2-3. redistribute neck volume into a child droplet (point: volume, velocity, position)
-            // close the slender jet at the new boundary at the pinch-off point
-            if (performPinchoff(currentState, lastNode, pinchThreshold, t, droplets)) {
-                z_tip = lastNode * SimulationParameters.dz;
-                const Droplet& d = droplets.back();
-                cout << "Droplet #" << droplets.size() << ": V = " << d.volume
-                     << " m^3, v = " << d.velocity << " m/s, z = " << d.position * 1e6
-                     << " µm. Jet now ends at node " << lastNode << endl;
-                // 4. recalculate the integrator from the current state and time
-                odes = buildODEs(lastNode);
-                ta = buildIntegrator(odes, currentState, t);
-                // 5. continue stepping (the loop continues with the new integrator)
+        if (neck >= 0) { // pinch-off: cells downstream of the neck become a drop
+            const double dz = s[iL] / N;
+            Drop d{0, 0, 0, t};
+            for (int j = neck + 1; j < N; j++) {
+                double dV = PI * s[j] * dz;
+                d.V += dV;
+                d.P += dV * 0.5 * (s[iV + j - 1] + s[iV + j]);
+                d.z += dV * (j + 0.5) * dz;
             }
-        } else if (lastNode < N - 1) {
-            // Advance jet front if not yet at the domain outflow
-            double v_tip = currentState[2 * lastNode + 1];
-            z_tip += v_tip * sampleTime;
-            bool advanced = false;
-            while (z_tip >= (lastNode + 1) * SimulationParameters.dz && lastNode < N - 1) {
-                lastNode++;
-                currentState[2 * lastNode] = currentState[2 * (lastNode - 1)];
-                currentState[2 * lastNode + 1] = currentState[2 * (lastNode - 1) + 1];
-                advanced = true;
+            d.z /= d.V;
+            drops.push_back(d);
+            remap(s, t, (neck + 0.5) * dz);
+            eventCsv << format("{},pinch,{},{},{}", t * us, d.z * um, d.R() * um, d.v() * uc) << endl;
+            cout << format("t = {:7.2f} us  pinch-off at z = {:6.1f} um   R = {:5.2f} um  v = {:.2f} m/s\n",
+                           t * us, (neck + 0.5) * dz * um, d.R() * um, d.v() * uc);
+            pinches++, neck = -1;
+            continue;
+        }
+        if (caught >= 0) { // the jet tip has reached a slower drop: add its mass and momentum to the tip cells
+            const Drop d = drops[caught];
+            drops.erase(drops.begin() + caught);
+            const double dz = s[iL] / N;
+            const int n = clamp(int(2.0 * d.R() / dz), 1, N - 1);
+            const double dA = d.V / (PI * n * dz);
+            for (int j = N - n; j < N; j++) s[j] += dA;
+            for (int k = N - n; k <= N; k++) { // mass-weighted face velocity
+                double aOld = s[min(k, N - 1)] - dA;
+                s[iV + k - 1] = (aOld * s[iV + k - 1] + dA * d.v()) / (aOld + dA);
             }
-            if (advanced) {
-                odes = buildODEs(lastNode);
-                ta = buildIntegrator(odes, currentState, t);
-            }
+            eventCsv << format("{},absorbed,{},{},{}", t * us, d.at(t) * um, d.R() * um, d.v() * uc) << endl;
+            caught = -1;
+            continue;
         }
 
-        // Advance each droplet based upon its current velocity and check for coalescence
-        advanceDroplets(droplets, sampleTime, t, z_tip);
-
-        nextSample += sampleTime;
+        // Output time: coalesce touching drops (momentum conserving), then write the frame
+        sort(drops.begin(), drops.end(), [&](auto& p, auto& q) { return p.at(t) < q.at(t); });
+        for (size_t i = 1; i < drops.size();) {
+            Drop &p = drops[i - 1], &q = drops[i];
+            if (q.at(t) - q.R() - p.at(t) - p.R() < gapMerge && p.v() > q.v()) {
+                p = {p.V + q.V, p.P + q.P, (p.V * p.at(t) + q.V * q.at(t)) / (p.V + q.V), t};
+                drops.erase(drops.begin() + i);
+            } else i++;
+        }
+        jetCsv << t * us << "," << s[iL] * um;
+        for (int j = 0; j < N; j++) jetCsv << "," << sqrt(s[j]) * um;
+        jetCsv << endl;
+        for (auto& d : drops) dropCsv << format("{},{},{},{}\n", t * us, d.at(t) * um, d.R() * um, d.v() * uc);
+        dropCsv.flush(), neckCsv.flush();
+        tOut += dtOut;
+        // Simulation Heartbeat: log jet properties every 10 output steps
+        if(fmod(tOut, dtOut) == 0){
+            cout << format("t = {:7.2f} us  total jet length = {:6.1f} um\n",
+                           t * us, s[iL] * um);
+        }
     }
-    clock_t stepEnd = clock();
-    double stepSeconds = double(stepEnd - stepStart) / CLOCKS_PER_SEC;
-    cout << "Total integration time: " << stepSeconds << " s" << endl;
-    cout << "Total elapsed time: " << double(clock() - mainStart) / CLOCKS_PER_SEC << " s" << endl;
-    return 0;
+    cout << format("Done in {:.1f} s, {} pinch-offs\n",
+                   chrono::duration<double>(chrono::steady_clock::now() - start).count(), pinches);
 }
